@@ -9,9 +9,10 @@
 #define PC_PORT 8080
 #define PC_PATH "/data"
 
-#define PIN_I2C_SDA 5
-#define PIN_I2C_SCL 6
+#define PIN_I2C_SDA 5   // D4 on XIAO ESP32-S3
+#define PIN_I2C_SCL 6   // D5 on XIAO ESP32-S3
 #define PIN_TEMP    1   // D0 = GPIO1 (1-Wire data, needs 2k-10k pull-up to 3V3)
+#define PIN_BUZZER  7   // D8 = GPIO7 on XIAO ESP32-S3 (active buzzer via NPN transistor)
 
 #define SAMPLE_HZ 100
 #define FEATURE_WINDOW_MS 2000

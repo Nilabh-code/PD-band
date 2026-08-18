@@ -32,6 +32,29 @@ bool ap_mode = true;
 bool wifi_ready = false;
 uint32_t last_wifi_check = 0;
 
+// Fall buzzer: 3 short beeps, non-blocking state machine.
+static uint32_t buzz_end = 0;
+static bool buzz_on = false;
+static uint8_t buzz_reps = 0;
+
+void beepStart() {
+  buzz_reps = 3; buzz_on = true; buzz_end = millis() + 200;
+  digitalWrite(PIN_BUZZER, HIGH);
+}
+
+void buzzerTick() {
+  uint32_t now = millis();
+  if (buzz_reps == 0) { digitalWrite(PIN_BUZZER, LOW); return; }
+  if (now < buzz_end) return;
+  if (buzz_on) {
+    buzz_on = false; buzz_end = now + 200;
+    digitalWrite(PIN_BUZZER, LOW);
+  } else {
+    buzz_on = true; buzz_end = now + 200; buzz_reps--;
+    digitalWrite(PIN_BUZZER, HIGH);
+  }
+}
+
 void raiseAlert(AlertType t, const String& msg) {
   int idx = (int)t;
   uint32_t now = millis();
@@ -39,6 +62,7 @@ void raiseAlert(AlertType t, const String& msg) {
   last_alert_ms[idx] = now;
   active_alert = msg;
   alert_until = now + 30000;
+  if (t == A_FALL) beepStart();
   if (cfg.hasTelegram()) Comms::sendTelegram("[PD Monitor] " + msg);
   Serial.println("ALERT: " + msg);
 }
@@ -55,14 +79,36 @@ void sampleTask(void* arg) {
     } else if (!mpu_ok) {
       // Bench SIM motion: 5 Hz tremor burst + low rumble so the whole
       // stream + dashboard pipeline runs without the MPU connected.
+      // Every ~75s inject a fake fall so buzzer + alert can be verified.
+      static bool sim_falling = false;
+      static uint32_t sim_fall_start = 0;
+      static uint32_t sim_fall_next = 40000;
+      uint32_t now = millis();
       sim_t_ms += 10;
-      float tm = sim_t_ms * 1e-3f;
-      float trem = 0.25f * sinf(2.0f * PI * 5.0f * tm);
-      float rum = 0.06f * sinf(2.0f * PI * 1.3f * tm);
-      float az = 1.0f + trem + rum;
-      float hp = engine.push(0.0f, 0.0f, az);
+      float ax, ay, az;
+      if (!sim_falling && now >= sim_fall_next) {
+        sim_falling = true; sim_fall_start = now;
+      }
+      if (sim_falling) {
+        uint32_t ph = now - sim_fall_start;
+        if (ph < 150) {        // impact impulse > FALL_IMPACT_G
+          az = 4.5f; ax = 0; ay = 0;
+        } else if (ph < 2000) {// still, tilted ~53deg so fall detector fires
+          az = 0.6f; ax = 0; ay = 0.8f;
+        } else {               // back upright
+          az = 1.0f; ax = 0; ay = 0;
+          sim_falling = false;
+          sim_fall_next = now + 75000;
+        }
+      } else {
+        float tm = sim_t_ms * 1e-3f;
+        float trem = 0.25f * sinf(2.0f * PI * 5.0f * tm);
+        float rum = 0.06f * sinf(2.0f * PI * 1.3f * tm);
+        az = 1.0f + trem + rum; ax = 0; ay = 0;
+      }
+      float hp = engine.push(ax, ay, az);
       spectrum.push(hp);
-      last_ax = 0; last_ay = 0; last_az = az; last_mpu_t = 0;
+      last_ax = ax; last_ay = ay; last_az = az; last_mpu_t = 0;
     }
     uint32_t dt = micros() - t0;
     if (dt < 10000) delayMicroseconds(10000 - dt);
@@ -168,6 +214,8 @@ void setup() {
 
   cfg.load();
   Comms::init(cfg);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
 
   Temp::begin();
   if (strcmp(Temp::typeName(), "none") == 0) {
@@ -194,6 +242,7 @@ uint32_t last_log_ms = 0;
 
 void loop() {
   Temp::poll();
+  buzzerTick();
 
   if (millis() - last_log_ms >= FEATURE_WINDOW_MS) {
     last_log_ms = millis();
