@@ -1,7 +1,4 @@
-#pragma once
-#include <Arduino.h>
-
-static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -994,7 +991,7 @@ label{
     });
 
     els.flagMeta.textContent = active.length
-      ? active.join(' · ')
+      ? active.join(' Â· ')
       : 'no active flags';
 
     if (s.alert) {
@@ -1007,10 +1004,10 @@ label{
 
     els.status.textContent =
       `fw ${s.fw == null ? '?' : s.fw}` +
-      ` · probe ${s.ttype == null ? '?' : s.ttype}` +
-      ` · log ${s.sd == null ? '?' : s.sd} rows` +
-      ` · WiFi ${s.wifi == null ? '?' : s.wifi}` +
-      ` · up ${formatUptime(Number(s.up))}`;
+      ` Â· probe ${s.ttype == null ? '?' : s.ttype}` +
+      ` Â· log ${s.sd == null ? '?' : s.sd} rows` +
+      ` Â· WiFi ${s.wifi == null ? '?' : s.wifi}` +
+      ` Â· up ${formatUptime(Number(s.up))}`;
   }
 
   function renderHistory(h) {
@@ -1264,8 +1261,8 @@ label{
         });
 
         if (j && j.ok) {
-          els.cfgHint.textContent = 'Saved. Device rebooting...';
-          setTimeout(() => location.reload(), 3500);
+          els.cfgHint.textContent = 'Saved.';
+          setTimeout(() => location.reload(), 1200);
         } else {
           els.cfgHint.textContent = 'Save failed: ' + ((j && (j.e || j.error)) || 'unknown error');
         }
@@ -1294,4 +1291,5 @@ label{
 })();
 </script>
 </body>
-</html>)rawliteral";
+</html>
+

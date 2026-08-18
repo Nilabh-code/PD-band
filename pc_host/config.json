@@ -1,0 +1,12 @@
+{
+  "ai_base": "https://api.openai.com/v1",
+  "ai_model": "gpt-4o-mini",
+  "ai_key": "",
+  "temp_low": 35.0,
+  "temp_high": 38.0,
+  "tremor_thr": 1.8,
+  "tg_token": "",
+  "tg_chat": "",
+  "ssid": "",
+  "pass": ""
+}

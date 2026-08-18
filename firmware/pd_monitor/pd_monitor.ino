@@ -1,6 +1,5 @@
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include "config.h"
@@ -8,14 +7,11 @@
 #include "detection.h"
 #include "fft.h"
 #include "temp.h"
-#include "storage.h"
 #include "comms.h"
-#include "web_ui.h"
 
 DeviceConfig cfg;
 DetectionEngine engine;
 Spectrum spectrum;
-WebServer server(80);
 TwoWire i2c(0);
 
 #define CV_WINDOW 30  // 30 x 2s windows = 60s of RMS history for CV%
@@ -26,13 +22,13 @@ uint8_t spec_bins[32];  // 0-12.5 Hz magnitude spectrum for the dashboard
 
 volatile bool mpu_ok = false;
 volatile float last_ax = 0, last_ay = 0, last_az = 0, last_mpu_t = 0;
-Features lastFeats;       // last completed 2s window, for the dashboard
+Features lastFeats;
 float lastDomFreq = 0, lastDomAmp = 0;
 uint32_t last_alert_ms[8] = {0};
 String active_alert;
 uint32_t alert_until = 0;
 
-bool ap_mode = false;
+bool ap_mode = true;
 bool wifi_ready = false;
 uint32_t last_wifi_check = 0;
 
@@ -48,6 +44,7 @@ void raiseAlert(AlertType t, const String& msg) {
 }
 
 void sampleTask(void* arg) {
+  uint32_t sim_t_ms = 0;
   for (;;) {
     uint32_t t0 = micros();
     float ax, ay, az, gx, gy, gz, t;
@@ -55,6 +52,17 @@ void sampleTask(void* arg) {
       float hp = engine.push(ax, ay, az);
       spectrum.push(hp);
       last_ax = ax; last_ay = ay; last_az = az; last_mpu_t = t;
+    } else if (!mpu_ok) {
+      // Bench SIM motion: 5 Hz tremor burst + low rumble so the whole
+      // stream + dashboard pipeline runs without the MPU connected.
+      sim_t_ms += 10;
+      float tm = sim_t_ms * 1e-3f;
+      float trem = 0.25f * sinf(2.0f * PI * 5.0f * tm);
+      float rum = 0.06f * sinf(2.0f * PI * 1.3f * tm);
+      float az = 1.0f + trem + rum;
+      float hp = engine.push(0.0f, 0.0f, az);
+      spectrum.push(hp);
+      last_ax = 0; last_ay = 0; last_az = az; last_mpu_t = 0;
     }
     uint32_t dt = micros() - t0;
     if (dt < 10000) delayMicroseconds(10000 - dt);
@@ -62,171 +70,57 @@ void sampleTask(void* arg) {
   }
 }
 
-String stateJson() {
-  Features fe = lastFeats;
-  uint16_t flags = 0;
-  float temp = Temp::get();
-  bool plausible = isfinite(temp) && temp > 15.0f && temp < 45.0f;
-  if (fe.ready) {
-    if (fe.band_amp > cfg.tremor_thr) flags |= F_TREMOR;
-    if (fe.fall) flags |= F_FALL;
-    if (fe.freeze_ratio > 1.5f && fe.g_rms < 0.5f) flags |= F_FREEZE;
-  }
-  if (plausible) {
-    if (temp < cfg.temp_low) flags |= F_TEMP_LOW;
-    if (temp > cfg.temp_high) flags |= F_TEMP_HIGH;
-  } else if (Temp::mode != 0) flags |= F_PROBE_ERR;
-  if (!ap_mode && WiFi.status() != WL_CONNECTED) flags |= F_WIFI_DOWN;
-
+// Build the small JSON window and stream it to the PC host.
+void streamToPC(const Features& fe, uint16_t flags, float temp, bool tempPlausible) {
+  if (WiFi.status() != WL_CONNECTED) return;
   JsonDocument doc;
   doc["fw"] = FW_VERSION;
   doc["ttype"] = Temp::typeName();
-  doc["sd"] = Store::size();
-  doc["wifi"] = ap_mode ? "AP:" + String(WiFi.softAPSSID()) : WiFi.localIP().toString();
-  doc["up"] = millis() / 1000;
-  doc["temp"] = plausible ? temp : NAN;
-  doc["rms"] = fe.ready ? fe.g_rms : 0;
-  doc["band"] = fe.ready ? fe.band_amp : 0;
+  doc["epoch"] = time(nullptr);
+  doc["uptime_ms"] = millis();
+  doc["temp"] = tempPlausible ? temp : NAN;
+  doc["rms"] = fe.g_rms;
+  doc["band"] = fe.band_amp;
+  doc["band_max"] = fe.band_max;
+  doc["freeze"] = fe.freeze_ratio;
   doc["flags"] = flags;
-  doc["ax"] = (float)last_ax; doc["ay"] = (float)last_ay; doc["az"] = (float)last_az;
-  doc["mpu_t"] = (float)last_mpu_t;
   doc["cv"] = cv_pct;
-  doc["df"] = lastDomFreq; doc["da"] = lastDomAmp;
+  doc["df"] = lastDomFreq;
+  doc["da"] = lastDomAmp;
+  doc["ax"] = (float)last_ax; doc["ay"] = (float)last_ay; doc["az"] = (float)last_az;
   doc["p_adc"] = Temp::rawAdc(); doc["p_r"] = Temp::rawR();
+  JsonArray spec = doc["spec"].to<JsonArray>();
+  for (int k = 0; k < 32; k++) spec.add(spec_bins[k]);
   if (millis() < alert_until && active_alert.length()) doc["alert"] = active_alert;
-  String out;
-  serializeJson(doc, out);
-  return out;
-}
 
-void handleState() { server.send(200, "application/json", stateJson()); }
+  String body;
+  serializeJson(doc, body);
 
-void handleHistory() {
-  JsonDocument doc;
-  JsonArray ta = doc["temp"].to<JsonArray>();
-  JsonArray ba = doc["band"].to<JsonArray>();
-  JsonArray ca = doc["cv"].to<JsonArray>();
-  JsonArray sa = doc["spec"].to<JsonArray>();
-  for (uint16_t i = 0; i < Store::size(); i++) {
-    const Sample& s = Store::at(i);
-    ta.add(isfinite(s.temp_c) ? s.temp_c : 0);
-    ba.add(s.tremor_band);
-    ca.add(s.cv_pct);
+  static bool busy = false;
+  if (busy) return;
+  busy = true;
+  HTTPClient http;
+  http.setTimeout(2000);
+  if (http.begin(String("http://") + PC_HOST + ":" + String(PC_PORT) + PC_PATH)) {
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(body);
+    if (code != 200 && Serial) Serial.printf("stream: HTTP %d\n", code);
+    http.end();
+  } else {
+    if (Serial) Serial.println("stream: begin failed");
   }
-  for (int k = 0; k < 32; k++) sa.add(spec_bins[k]);
-  String out;
-  serializeJson(doc, out);
-  server.send(200, "application/json", out);
-}
-
-void handleChat() {
-  if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"e\":\"no body\"}"); return; }
-  JsonDocument in;
-  if (deserializeJson(in, server.arg("plain"))) { server.send(400, "application/json", "{\"e\":\"bad json\"}"); return; }
-  String q = in["q"].as<String>();
-  if (!q.length()) { server.send(400, "application/json", "{\"e\":\"empty\"}"); return; }
-
-  float temp = Temp::get();
-  Features fe = lastFeats;
-  String sys = String("You are a health-assistant AI embedded in a wearable Parkinson's screening device (ankle-mounted).\n") +
-    "Current readings: body_temp=" + (isfinite(temp) ? String(temp, 2) : String("n/a")) + "C, " +
-    "motion_rms=" + String(fe.g_rms, 3) + "g, tremor_band(3-8Hz)=" + String(fe.band_amp, 3) + "g, " +
-    "freeze_ratio=" + String(fe.freeze_ratio, 2) + ", fall_detected=" + String(fe.fall ? "yes" : "no") +
-    ", gait_variability(CV%)=" + String(cv_pct, 1) +
-    ", dominant_motion_freq=" + String(lastDomFreq, 2) + "Hz (amp " + String(lastDomAmp, 3) + "g).\n" +
-    "Thresholds: low_temp=" + String(cfg.temp_low, 1) + "C, high_temp=" + String(cfg.temp_high, 1) +
-    "C, tremor_thr=" + String(cfg.tremor_thr, 2) + "g.\n" +
-    "Interpret findings in plain language, flag concerning patterns (hypothermia, tremor, freezing of gait, falls, " +
-    "high gait variability CV%, rhythmic tremor peaks at 4-6Hz), " +
-    "and ALWAYS recommend consulting a doctor. Never diagnose. Keep it short.";
-
-  JsonDocument msgs;
-  msgs[0]["role"] = "system";
-  msgs[0]["content"] = sys;
-  msgs[1]["role"] = "user";
-  msgs[1]["content"] = q;
-
-  String reply;
-  bool ok = Comms::aiChat(msgs, reply);
-  JsonDocument out;
-  if (ok) out["a"] = reply; else out["e"] = reply;
-  String resp;
-  serializeJson(out, resp);
-  server.send(200, "application/json", resp);
-}
-
-void handleConfigGet() {
-  JsonDocument doc;
-  doc["ssid"] = cfg.wifi_ssid;
-  doc["tg_token_set"] = cfg.tg_token[0] != 0;
-  doc["tg_token"] = cfg.tg_token[0] != 0 ? "*" : "";
-  doc["tg_chat"] = cfg.tg_chat;
-  doc["ai_base"] = cfg.ai_base;
-  doc["ai_model"] = cfg.ai_model;
-  doc["ai_key_set"] = cfg.ai_key[0] != 0;
-  doc["temp_low"] = cfg.temp_low;
-  doc["temp_high"] = cfg.temp_high;
-  doc["tremor_thr"] = cfg.tremor_thr;
-  String out;
-  serializeJson(doc, out);
-  server.send(200, "application/json", out);
-}
-
-void handleConfigPost() {
-  JsonDocument in;
-  if (deserializeJson(in, server.arg("plain"))) { server.send(400, "application/json", "{\"ok\":false}"); return; }
-  bool wifiChanged = false;
-  auto str = [&](const char* k, char* dst, size_t n) {
-    if (in[k].is<const char*>()) { strncpy(dst, in[k].as<const char*>(), n - 1); dst[n - 1] = 0; }
-  };
-  if (in["ssid"].is<const char*>()) {
-    wifiChanged = strcmp(cfg.wifi_ssid, in["ssid"]) != 0 ||
-                  (in["pass"].is<const char*>() && strcmp(cfg.wifi_pass, in["pass"]) != 0);
-  }
-  str("ssid", cfg.wifi_ssid, sizeof(cfg.wifi_ssid));
-  str("pass", cfg.wifi_pass, sizeof(cfg.wifi_pass));
-  str("tg_token", cfg.tg_token, sizeof(cfg.tg_token));
-  str("tg_chat", cfg.tg_chat, sizeof(cfg.tg_chat));
-  str("ai_base", cfg.ai_base, sizeof(cfg.ai_base));
-  str("ai_model", cfg.ai_model, sizeof(cfg.ai_model));
-  const char* k = in["ai_key"];
-  if (k && strlen(k) > 0 && strcmp(k, "(set)") != 0) {
-    strncpy(cfg.ai_key, k, sizeof(cfg.ai_key) - 1);
-  }
-  if (in["tlo"].is<float>()) cfg.temp_low = in["tlo"];
-  if (in["thi"].is<float>()) cfg.temp_high = in["thi"];
-  if (in["ttr"].is<float>()) cfg.tremor_thr = in["ttr"];
-  cfg.save();
-  server.send(200, "application/json", "{\"ok\":true}");
-  if (wifiChanged) { delay(500); ESP.restart(); }
-}
-
-void handleLogs() {
-  String out = Store::csv();
-  server.sendHeader("Content-Disposition", "attachment; filename=pd_log.csv");
-  server.send(200, "text/csv", out);
-}
-
-void handleLogView() {
-  String out = Store::tail(140);
-  if (!out.length()) out = "no log data yet (MPU not connected or first 2s window pending)\n";
-  server.send(200, "text/plain", out);
+  busy = false;
 }
 
 void setupAP() {
   ap_mode = true;
   WiFi.mode(WIFI_AP);
   WiFi.softAP("PD_Monitor", "monitor123");
-  Serial.println("AP mode: SSID=PD_Monitor pass=monitor123 -> http://192.168.4.1");
+  Serial.println("AP mode: SSID=PD_Monitor pass=monitor123");
 }
 
-void setupWiFi() {
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP("PD_Monitor", "monitor123");
-  Serial.println("AP active: PD_Monitor/monitor123 (fallback access)");
-
-  // Scan and connect by BSSID to match the exact SSID bytes (hotspots can
-  // carry trailing spaces / hidden whitespace).
+// Scan and connect by BSSID so we match the exact hotspot SSID bytes.
+bool connectSTA() {
   int n = WiFi.scanNetworks();
   int best = -1, bestRssi = -999;
   for (int i = 0; i < n; i++) {
@@ -246,31 +140,34 @@ void setupWiFi() {
     delay(250); Serial.print(".");
   }
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf(" failed (status=%d), AP fallback only, will retry\n", WiFi.status());
-    return;
+    Serial.printf(" failed (status=%d)\n", WiFi.status());
+    return false;
   }
-  // The board sits near the AP/hotspot, so a low TX power is ample and
-  // prevents brownout current spikes when serving the dashboard.
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   Serial.println(" ok: " + WiFi.localIP().toString());
   wifi_ready = true;
   configTzTime("UTC", "pool.ntp.org", "time.nist.gov");
-  MDNS.begin("pdmonitor");
-  MDNS.addService("http", "tcp", 80);
+  return true;
+}
+
+void setupWiFi() {
+  ap_mode = false;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("PD_Monitor", "monitor123");  // fallback access
+  if (connectSTA()) ap_mode = false; else ap_mode = true;
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\nPD Monitor " FW_VERSION);
+  Serial.println("\nPD Monitor " FW_VERSION " (streamer, PC dashboard)");
 
-  // 160 MHz is plenty for sampling + web serving and keeps current draw
-  // (and brownout risk on marginal USB power) well below that at 240 MHz.
+  // 160 MHz is plenty for sampling + streaming and keeps current draw (and
+  // brownout risk on marginal USB power) well below that at 240 MHz.
   setCpuFrequencyMhz(160);
 
   cfg.load();
   Comms::init(cfg);
-  Store::begin();
 
   Temp::begin();
   if (strcmp(Temp::typeName(), "none") == 0) {
@@ -286,20 +183,7 @@ void setup() {
   Serial.println(mpu_ok ? "MPU6050 ok" : "MPU6050 NOT FOUND");
 
   if (!cfg.hasWifi()) setupAP(); else setupWiFi();
-  ap_mode = false;  // AP now runs alongside STA as fallback
-
-  server.on("/", HTTP_GET, []() {
-    String page = FPSTR(INDEX_HTML);
-    server.send(200, "text/html", page);
-  });
-  server.on("/api/state", HTTP_GET, handleState);
-  server.on("/api/history", HTTP_GET, handleHistory);
-  server.on("/api/chat", HTTP_POST, handleChat);
-  server.on("/api/config", HTTP_GET, handleConfigGet);
-  server.on("/api/config", HTTP_POST, handleConfigPost);
-  server.on("/api/logs", HTTP_GET, handleLogs);
-  server.on("/api/log", HTTP_GET, handleLogView);
-  server.begin();
+  Serial.printf("Streaming to http://%s:%d%s\n", PC_HOST, PC_PORT, PC_PATH);
 
   // NOTE: must run at the SAME priority as the Arduino loop task (1) on the
   // same core, otherwise this busy-waiting sampler starves setup()/loop().
@@ -309,44 +193,36 @@ void setup() {
 uint32_t last_log_ms = 0;
 
 void loop() {
-  server.handleClient();
   Temp::poll();
 
   if (millis() - last_log_ms >= FEATURE_WINDOW_MS) {
     last_log_ms = millis();
     Features fe = engine.peek();
     if (fe.ready) {
-      Sample s;
-      s.uptime_ms = millis();
-      s.epoch = time(nullptr);
+      uint16_t flags = 0;
       float t = Temp::get();
-      s.temp_c = (isfinite(t) && t > 15.0f && t < 45.0f) ? t : NAN;
-      s.g_rms = fe.g_rms;
-      s.tremor_band = fe.band_amp;
-      s.band_max = fe.band_max;
-      s.freeze_score = fe.freeze_ratio;
-      s.flags = 0;
+      bool tempPlausible = isfinite(t) && t > 15.0f && t < 45.0f;
 
-      if (isfinite(s.temp_c)) {
-        if (s.temp_c < cfg.temp_low) { s.flags |= F_TEMP_LOW; raiseAlert(A_TEMP_LOW, "Body temp low: " + String(s.temp_c, 1) + "C"); }
-        if (s.temp_c > cfg.temp_high) { s.flags |= F_TEMP_HIGH; raiseAlert(A_TEMP_HIGH, "Body temp high: " + String(s.temp_c, 1) + "C"); }
+      if (tempPlausible) {
+        if (t < cfg.temp_low) { flags |= F_TEMP_LOW; raiseAlert(A_TEMP_LOW, "Body temp low: " + String(t, 1) + "C"); }
+        if (t > cfg.temp_high) { flags |= F_TEMP_HIGH; raiseAlert(A_TEMP_HIGH, "Body temp high: " + String(t, 1) + "C"); }
       }
-
-      if (fe.band_amp > cfg.tremor_thr) { s.flags |= F_TREMOR; raiseAlert(A_TREMOR, "Tremor band spike: " + String(fe.band_amp, 3) + "g"); }
-      if (fe.freeze_ratio > 1.5f && fe.g_rms < 0.5f && fe.band_amp > 0.03f) { s.flags |= F_FREEZE; raiseAlert(A_FREEZE, "Freezing-of-gait pattern"); }
-      if (fe.fall) { s.flags |= F_FALL; raiseAlert(A_FALL, "Fall detected!"); }
+      if (fe.band_amp > cfg.tremor_thr) { flags |= F_TREMOR; raiseAlert(A_TREMOR, "Tremor band spike: " + String(fe.band_amp, 3) + "g"); }
+      if (fe.freeze_ratio > 1.5f && fe.g_rms < 0.5f && fe.band_amp > 0.03f) { flags |= F_FREEZE; raiseAlert(A_FREEZE, "Freezing-of-gait pattern"); }
+      if (fe.fall) { flags |= F_FALL; raiseAlert(A_FALL, "Fall detected!"); }
+      if (!ap_mode && WiFi.status() != WL_CONNECTED) flags |= F_WIFI_DOWN;
 
       // FFT: full spectrum, dominant peak
       spectrum.analyze();
-      s.dom_freq = spectrum.dominantFreq();
-      s.dom_amp = spectrum.dominantAmp();
+      lastDomFreq = spectrum.dominantFreq();
+      lastDomAmp = spectrum.dominantAmp();
       for (int k = 0; k < 32; k++) {
         float m = spectrum.binAmp(k);
         spec_bins[k] = m > 2.54f ? 255 : (uint8_t)(m * 100.0f);
       }
 
       // CV% of RMS over the last 60s (stride-regularity proxy)
-      rms_hist[rms_hist_idx] = s.g_rms;
+      rms_hist[rms_hist_idx] = fe.g_rms;
       rms_hist_idx = (rms_hist_idx + 1) % CV_WINDOW;
       if (rms_hist_n < CV_WINDOW) rms_hist_n++;
       if (rms_hist_n > 1) {
@@ -357,14 +233,11 @@ void loop() {
         float sd = sqrtf(fmaxf(0.0f, var));
         cv_pct = mean > 0.05f ? (sd / mean) * 100.0f : 0.0f;
       }
-      s.cv_pct = cv_pct;
 
       lastFeats = fe;
       lastFeats.ready = true;
-      lastDomFreq = s.dom_freq;
-      lastDomAmp = s.dom_amp;
 
-      Store::append(s);
+      streamToPC(fe, flags, t, tempPlausible);
     }
     engine.clear();
   }
@@ -374,13 +247,7 @@ void loop() {
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("WiFi retry...");
       WiFi.disconnect();
-      WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
-    } else if (!wifi_ready) {
-      wifi_ready = true;
-      Serial.println("WiFi up: " + WiFi.localIP().toString());
-      configTzTime("UTC", "pool.ntp.org", "time.nist.gov");
-      MDNS.begin("pdmonitor");
-      MDNS.addService("http", "tcp", 80);
+      connectSTA();
     }
   }
   delay(20);
