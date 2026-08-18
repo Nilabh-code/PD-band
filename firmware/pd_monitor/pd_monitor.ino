@@ -169,7 +169,8 @@ void handleChat() {
 void handleConfigGet() {
   JsonDocument doc;
   doc["ssid"] = cfg.wifi_ssid;
-  doc["tg_token"] = cfg.tg_token;
+  doc["tg_token_set"] = cfg.tg_token[0] != 0;
+  doc["tg_token"] = cfg.tg_token[0] != 0 ? "*" : "";
   doc["tg_chat"] = cfg.tg_chat;
   doc["ai_base"] = cfg.ai_base;
   doc["ai_model"] = cfg.ai_model;
