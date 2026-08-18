@@ -28,8 +28,6 @@ volatile bool mpu_ok = false;
 volatile float last_ax = 0, last_ay = 0, last_az = 0, last_mpu_t = 0;
 Features lastFeats;       // last completed 2s window, for the dashboard
 float lastDomFreq = 0, lastDomAmp = 0;
-Sample history[HISTORY_LEN];
-uint16_t hist_head = 0, hist_count = 0;
 uint32_t last_alert_ms[8] = {0};
 String active_alert;
 uint32_t alert_until = 0;
@@ -38,12 +36,6 @@ bool ap_mode = false;
 bool wifi_ready = false;
 uint32_t last_wifi_check = 0;
 
-void addHistory(const Sample& s) {
-  history[hist_head] = s;
-  hist_head = (hist_head + 1) % HISTORY_LEN;
-  if (hist_count < HISTORY_LEN) hist_count++;
-}
-
 void raiseAlert(AlertType t, const String& msg) {
   int idx = (int)t;
   uint32_t now = millis();
@@ -51,7 +43,6 @@ void raiseAlert(AlertType t, const String& msg) {
   last_alert_ms[idx] = now;
   active_alert = msg;
   alert_until = now + 30000;
-  Store::appendAlert(t, Temp::get(), 0, msg.c_str());
   if (cfg.hasTelegram()) Comms::sendTelegram("[PD Monitor] " + msg);
   Serial.println("ALERT: " + msg);
 }
@@ -85,13 +76,12 @@ String stateJson() {
     if (temp < cfg.temp_low) flags |= F_TEMP_LOW;
     if (temp > cfg.temp_high) flags |= F_TEMP_HIGH;
   } else if (Temp::mode != 0) flags |= F_PROBE_ERR;
-  if (!Store::mounted) flags |= F_SD_ERR;
   if (!ap_mode && WiFi.status() != WL_CONNECTED) flags |= F_WIFI_DOWN;
 
   JsonDocument doc;
   doc["fw"] = FW_VERSION;
   doc["ttype"] = Temp::typeName();
-  doc["sd"] = Store::mounted ? String(Store::cardMB()) + "MB" : "none";
+  doc["sd"] = Store::size();
   doc["wifi"] = ap_mode ? "AP:" + String(WiFi.softAPSSID()) : WiFi.localIP().toString();
   doc["up"] = millis() / 1000;
   doc["temp"] = plausible ? temp : NAN;
@@ -117,9 +107,8 @@ void handleHistory() {
   JsonArray ba = doc["band"].to<JsonArray>();
   JsonArray ca = doc["cv"].to<JsonArray>();
   JsonArray sa = doc["spec"].to<JsonArray>();
-  uint16_t start = (hist_head - hist_count + HISTORY_LEN) % HISTORY_LEN;
-  for (uint16_t i = 0; i < hist_count; i++) {
-    const Sample& s = history[(start + i) % HISTORY_LEN];
+  for (uint16_t i = 0; i < Store::size(); i++) {
+    const Sample& s = Store::at(i);
     ta.add(isfinite(s.temp_c) ? s.temp_c : 0);
     ba.add(s.tremor_band);
     ca.add(s.cv_pct);
@@ -213,25 +202,13 @@ void handleConfigPost() {
 }
 
 void handleLogs() {
-  if (!Store::mounted || !Store::logFile) { server.send(404, "text/plain", "no logs"); return; }
-  File f = Store::logFile;
+  String out = Store::csv();
   server.sendHeader("Content-Disposition", "attachment; filename=pd_log.csv");
-  server.streamFile(f, "text/csv");
+  server.send(200, "text/csv", out);
 }
 
 void handleLogView() {
-  String out;
-  if (Store::mounted && Store::logFile) {
-    File f = Store::logFile;
-    size_t sz = f.size();
-    size_t off = sz > 8000 ? sz - 8000 : 0;
-    f.seek(off);
-    uint8_t* buf = (uint8_t*)malloc(8192);
-    int rd = f.read(buf, 8000);
-    if (rd > 0) out = String((char*)buf);
-    free(buf);
-  } else out = "no log data";
-  server.send(200, "text/plain", out);
+  server.send(200, "text/plain", Store::tail(140));
 }
 
 void setupAP() {
@@ -285,8 +262,6 @@ void setup() {
   cfg.load();
   Comms::init(cfg);
   Store::begin();
-  if (Store::mounted) Serial.printf("SD card: %u MB\n", (unsigned)Store::cardMB());
-  else Serial.println("SD card not found");
 
   Temp::begin();
   if (strcmp(Temp::typeName(), "none") == 0) {
@@ -376,7 +351,6 @@ void loop() {
       lastDomAmp = s.dom_amp;
 
       Store::append(s);
-      addHistory(s);
     }
     engine.clear();
   }

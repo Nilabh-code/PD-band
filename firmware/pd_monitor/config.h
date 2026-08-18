@@ -7,10 +7,6 @@
 #define PIN_I2C_SDA 5
 #define PIN_I2C_SCL 6
 #define PIN_TEMP    1   // D0 = GPIO1 (1-Wire data, needs 2k-10k pull-up to 3V3)
-#define PIN_SD_CS   3
-#define PIN_SD_SCK  7
-#define PIN_SD_MISO 8
-#define PIN_SD_MOSI 9
 
 #define SAMPLE_HZ 100
 #define FEATURE_WINDOW_MS 2000
@@ -20,7 +16,6 @@
 #define TEMP_LOW_C 35.0f
 #define TEMP_HIGH_C 38.0f
 #define ALERT_COOLDOWN_MS 60000UL
-#define HISTORY_LEN 450
 
 enum Flag : uint16_t {
   F_TEMP_LOW    = 0x01,
@@ -29,7 +24,6 @@ enum Flag : uint16_t {
   F_FREEZE      = 0x08,
   F_FALL        = 0x10,
   F_PROBE_ERR   = 0x20,
-  F_SD_ERR      = 0x40,
   F_WIFI_DOWN   = 0x80,
 };
 

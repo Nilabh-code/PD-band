@@ -670,7 +670,6 @@ label{
     ['FREEZE', 0x08],
     ['FALL', 0x10],
     ['PROBE', 0x20],
-    ['SD', 0x40],
     ['OFFLINE', 0x80]
   ];
 
@@ -1009,7 +1008,7 @@ label{
     els.status.textContent =
       `fw ${s.fw == null ? '?' : s.fw}` +
       ` · probe ${s.ttype == null ? '?' : s.ttype}` +
-      ` · SD ${s.sd == null ? '?' : s.sd}` +
+      ` · log ${s.sd == null ? '?' : s.sd} rows` +
       ` · WiFi ${s.wifi == null ? '?' : s.wifi}` +
       ` · up ${formatUptime(Number(s.up))}`;
   }
