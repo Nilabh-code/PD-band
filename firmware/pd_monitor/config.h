@@ -44,6 +44,8 @@ struct Sample {
 };
 
 struct DeviceConfig {
+  // Leave blank for AP-only mode; set here or via the web Settings page.
+  // Never commit real credentials to a public repo.
   char wifi_ssid[33] = "";
   char wifi_pass[65] = "";
   char tg_token[64] = "";

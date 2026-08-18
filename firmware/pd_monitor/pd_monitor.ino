@@ -208,7 +208,9 @@ void handleLogs() {
 }
 
 void handleLogView() {
-  server.send(200, "text/plain", Store::tail(140));
+  String out = Store::tail(140);
+  if (!out.length()) out = "no log data yet (MPU not connected or first 2s window pending)\n";
+  server.send(200, "text/plain", out);
 }
 
 void setupAP() {
@@ -247,6 +249,9 @@ void setupWiFi() {
     Serial.printf(" failed (status=%d), AP fallback only, will retry\n", WiFi.status());
     return;
   }
+  // The board sits near the AP/hotspot, so a low TX power is ample and
+  // prevents brownout current spikes when serving the dashboard.
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   Serial.println(" ok: " + WiFi.localIP().toString());
   wifi_ready = true;
   configTzTime("UTC", "pool.ntp.org", "time.nist.gov");
@@ -258,6 +263,10 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\nPD Monitor " FW_VERSION);
+
+  // 160 MHz is plenty for sampling + web serving and keeps current draw
+  // (and brownout risk on marginal USB power) well below that at 240 MHz.
+  setCpuFrequencyMhz(160);
 
   cfg.load();
   Comms::init(cfg);
@@ -279,7 +288,10 @@ void setup() {
   if (!cfg.hasWifi()) setupAP(); else setupWiFi();
   ap_mode = false;  // AP now runs alongside STA as fallback
 
-  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", INDEX_HTML); });
+  server.on("/", HTTP_GET, []() {
+    String page = FPSTR(INDEX_HTML);
+    server.send(200, "text/html", page);
+  });
   server.on("/api/state", HTTP_GET, handleState);
   server.on("/api/history", HTTP_GET, handleHistory);
   server.on("/api/chat", HTTP_POST, handleChat);
@@ -289,7 +301,9 @@ void setup() {
   server.on("/api/log", HTTP_GET, handleLogView);
   server.begin();
 
-  xTaskCreatePinnedToCore(sampleTask, "sam", 8192, NULL, 2, NULL, 1);
+  // NOTE: must run at the SAME priority as the Arduino loop task (1) on the
+  // same core, otherwise this busy-waiting sampler starves setup()/loop().
+  xTaskCreatePinnedToCore(sampleTask, "sam", 8192, NULL, 1, NULL, 1);
 }
 
 uint32_t last_log_ms = 0;
